@@ -197,13 +197,12 @@ int main(int argc, char** argv)
   bench_timer_stop();
 
   if (rank == 0) {
-      printf("\n\n");
       printf("Time: ");
       bench_timer_print();
 
       //if (argc > 42 && ! strcmp(argv[0], ""))
-      //printf("\nMATRIX C AFTER CALCULATION:\n");
-      //print_array(ni, nj, *C);
+      printf("\nMATRIX C AFTER CALCULATION:\n");
+      print_array(ni, nj, *C);
   }
 
   free((void*)C);
