@@ -76,9 +76,9 @@ static BlockInfo* get_process_blocks(int ni, int nj,
 // Функция для печати информации о блоках (для отладки)
 static void print_process_blocks_info(BlockInfo *blocks, int num_blocks, 
                                       int rank, int size) {
-    printf("Process %d/%d has %d blocks:\n", rank, size, num_blocks);
+    fprintf(stderr, "Process %d/%d has %d blocks:\n", rank, size, num_blocks);
     for (int b = 0; b < num_blocks; b++) {
-        printf("  Block %d: rows [%d,%d), cols [%d,%d) [ID=%d]\n", 
+        fprintf(stderr, "  Block %d: rows [%d,%d), cols [%d,%d) [ID=%d]\n",
                b, blocks[b].start_i, blocks[b].end_i, 
                blocks[b].start_j, blocks[b].end_j, blocks[b].block_id);
     }
@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
   bench_timer_stop();
 
   if (rank == 0) {
-      printf("Time: ");
+      printf("\nTime: ");
       bench_timer_print();
 
       //if (argc > 42 && ! strcmp(argv[0], ""))
