@@ -332,52 +332,69 @@ static int run_gemm(float alpha, float beta) {
 }
 
 // Восстановление после сбоя
+// Восстановление после сбоя
 static int recovery_procedure(float alpha, float beta) {
     ROOTLOG("Failure detected, revoke+shrink communicator");
-    
+
     MPIX_Comm_revoke(main_comm);
-    
+
     MPI_Comm new_comm;
     MPIX_Comm_shrink(main_comm, &new_comm);
     MPI_Comm_free(&main_comm);
     main_comm = new_comm;
-    
+
     MPI_Comm_set_errhandler(main_comm, MPI_ERRORS_RETURN);
     MPI_Comm_size(main_comm, &process_count);
     MPI_Comm_rank(main_comm, &process_rank);
-    
+
     ROOTLOG("New communicator: size=%d", process_count);
-    
-    // Обновляем desired_active
-    if (desired_active > process_count) {
-        desired_active = process_count;
+
+    // Уменьшаем количество spare процессов на 1
+    if (spare_count > 0) {
+        spare_count--;
+        ROOTLOG("Spare count decreased to %d", spare_count);
     }
-    
-    // Перераспределяем блоки
+
+    // Рассчитываем новое количество активных процессов
+    // Активных должно остаться столько же, сколько было до сбоя
+    int new_active = process_count - spare_count;
+    if (new_active < 1) new_active = process_count; // Все процессы активные, если spare_count >= process_count
+
+    // Перераспределяем блоки ТОЛЬКО для активных процессов
     free_resources();
     if (allocate_matrices() != 0) {
         ROOTLOG("ERROR: Allocation failed after shrink");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    
-    // ВАЖНО: ВСЕ процессы получают блоки после shrink
-    blocks = get_process_blocks(NI, NJ, process_rank, process_count, &num_blocks);
-    
+
+    // ВАЖНО: блоки получают только активные процессы (ранг < new_active)
+    if (process_rank < new_active) {
+        blocks = get_process_blocks(NI, NJ, process_rank, new_active, &num_blocks);
+        ROOTLOG("Active process with %d blocks", num_blocks);
+    } else {
+        // Spare процессы остаются без блоков
+        blocks = NULL;
+        num_blocks = 0;
+        ROOTLOG("Spare process - no blocks assigned");
+    }
+
     // Восстановление из контрольной точки
     int kk_from_cp = 0;
     int cp_res = checkpoint_read(&kk_from_cp);
-    
+
     if (cp_res <= 0) {
         kk_current = 0;
+        // Инициализируем матрицы (только активные процессы инициализируют свои блоки C)
         init_matrices(alpha, beta);
         ROOTLOG("No checkpoint found, starting from scratch");
     } else {
         kk_current = kk_from_cp;
+        // Рассылаем A и B всем процессам (и активным, и spare)
         MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
         MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
         ROOTLOG("Restarting from checkpoint kk=%d", kk_current);
     }
-    
+
     return MPI_SUCCESS;
 }
 
@@ -405,76 +422,79 @@ static int verify_result(void) {
 
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
-    
+
     main_comm = MPI_COMM_WORLD;
     MPI_Comm_set_errhandler(main_comm, MPI_ERRORS_RETURN);
-    
+
     MPI_Comm_size(main_comm, &process_count);
     MPI_Comm_rank(main_comm, &process_rank);
-    
+
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank0);
     world_size0 = process_count;
-    
+
+    // Инициализация spare_count
+    spare_count = 2; // Например, 2 spare процесса
     if (spare_count >= world_size0) spare_count = 0;
+
     desired_active = world_size0 - spare_count;
     if (desired_active < 1) desired_active = world_size0;
-    
+
     if (process_rank == 0) {
         ROOTLOG("GEMM start: NI=%d, NJ=%d, NK=%d", NI, NJ, NK);
-        ROOTLOG("Total ranks=%d, active=%d, spare=%d", 
+        ROOTLOG("Total ranks=%d, active=%d, spare=%d",
                 world_size0, desired_active, spare_count);
     }
-    
+
     // Инициализация блоков для активных процессов
     if (process_rank < desired_active) {
         blocks = get_process_blocks(NI, NJ, process_rank, desired_active, &num_blocks);
     } else {
-        // Резервные процессы не имеют блоков
+        // Spare процессы не имеют блоков
         blocks = NULL;
         num_blocks = 0;
     }
-    
+
     if (allocate_matrices() != 0) {
         if (process_rank == 0) ROOTLOG("ERROR: Allocation failed");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    
+
     float alpha = 1.5, beta = 1.2;
-    
+
     int cp_res = checkpoint_read(&kk_current);
     if (cp_res <= 0) {
         kk_current = 0;
         init_matrices(alpha, beta);
     }
-    
+
     bench_timer_start();
-    
+
     // Основной цикл с восстановлением
     while (1) {
         int err = run_gemm(alpha, beta);
         if (err == MPI_SUCCESS) break;
-        
+
         err = recovery_procedure(alpha, beta);
         if (err != MPI_SUCCESS) {
             ROOTLOG("FATAL: Recovery failed");
             MPI_Abort(MPI_COMM_WORLD, 2);
         }
     }
-    
+
     bench_timer_stop();
-    
+
     if (process_rank == 0) {
         MPI_Reduce(MPI_IN_PLACE, C, NI * NJ, MPI_FLOAT, MPI_SUM, 0, main_comm);
     } else {
         MPI_Reduce(C, NULL, NI * NJ, MPI_FLOAT, MPI_SUM, 0, main_comm);
     }
-    
+
     verify_result();
-    
+
     if (process_rank == 0) {
         printf("\nTime: ");
         bench_timer_print();
-        
+
         printf("\nFirst 4x4 of matrix C:\n");
         for (int i = 0; i < 4 && i < NI; i++) {
             for (int j = 0; j < 4 && j < NJ; j++) {
@@ -483,9 +503,9 @@ int main(int argc, char **argv) {
             printf("\n");
         }
     }
-    
+
     free_resources();
-    
+
     if (process_rank == 0) ROOTLOG("Finalizing MPI");
     MPI_Finalize();
     return 0;
