@@ -12,7 +12,7 @@
 #define BLOCK_SIZE 2
 
 #define FAIL_RANK 2
-#define FAIL_K 0
+#define FAIL_K 2
 #define SPARE_COUNT 2
 #define CHECKPOINT_FILENAME "checkpoint.bin"
 
@@ -290,7 +290,7 @@ static int run_gemm(float alpha, float beta) {
 
     for (int k = k_current; k < NK; k += BLOCK_SIZE) {
         // Симуляция сбоя
-        if (!failure_simulated && world_rank0 == FAIL_RANK && k == FAIL_K) {
+        if (!failure_simulated && world_rank0 == FAIL_RANK) {
             RANKLOG("Simulating failure (world_rank0=%d)", k, world_rank0);
             failure_simulated = 1;
             raise(SIGKILL);
