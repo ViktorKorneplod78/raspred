@@ -147,15 +147,10 @@ static void kernel_gemm_with_blocks(int ni, int nj, int nk,
             }
         }
         
-        // Шаг 2: Блочное умножение по k
-        for (int kk = 0; kk < nk; kk += BLOCK_SIZE) {
-            int k_end = (kk + BLOCK_SIZE > nk) ? nk : kk + BLOCK_SIZE;
-            
-            for (int i = start_i; i < end_i; i++) {
-                for (int j = start_j; j < end_j; j++) {
-                    for (int k = kk; k < k_end; k++) {
-                        C[i][j] += alpha * A[i][k] * B[k][j];
-                    }
+        for (int i = start_i; i < end_i; i++) {
+            for (int j = start_j; j < end_j; j++) {
+                for (int k = 0; k < nk; k++) {
+                    C[i][j] += alpha * A[i][k] * B[k][j];
                 }
             }
         }
