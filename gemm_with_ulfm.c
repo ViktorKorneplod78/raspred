@@ -18,7 +18,7 @@
 #define BLOCK_SIZE 2
 
 #define FAIL_RANK 2
-#define FAIL_K 2
+#define FAIL_K 0
 #define SPARE_COUNT 2
 #define CHECKPOINT_FILENAME "checkpoint.bin"
 
