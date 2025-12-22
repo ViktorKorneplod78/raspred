@@ -369,9 +369,6 @@ static int recovery_procedure(float alpha, float beta) {
         ROOTLOG("No checkpoint found, starting from scratch");
     } else {
         k_current = k_from_cp;
-        // Рассылаем A и B всем процессам (и активным, и spare)
-        MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
-        MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
         ROOTLOG("Restarting from checkpoint kk=%d", k_current);
     }
 
