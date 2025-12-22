@@ -1,3 +1,9 @@
+/*
+ * mpicc -O2 gemm_with_ulfm.c -o gemm_with_ulfm
+ * mpirun -np 6 --with-ft ulfm gemm_with_ulfm
+ * rm checkpoint.bin
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
