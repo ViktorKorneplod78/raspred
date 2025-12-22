@@ -1,8 +1,3 @@
-// mpi_gemm_ulfm_fixed.c
-/* сборка + запуск 
-mpicc -O2 mpi_gemm_ulfm_fixed.c -o mpi_gemm_ulfm_fixed
-mpirun --with-ft ulfm -np 6 --oversubscribe ./mpi_gemm_ulfm_fixed */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,13 +6,14 @@ mpirun --with-ft ulfm -np 6 --oversubscribe ./mpi_gemm_ulfm_fixed */
 #include <mpi.h>
 #include <mpi-ext.h>
 
-#define NI 256
-#define NJ 256
-#define NK 256
-#define BLOCK_SIZE 32
+#define NI 8
+#define NJ 8
+#define NK 8
+#define BLOCK_SIZE 2
 
-#define FAIL_WORLD_RANK 2
-#define FAIL_KK 2
+#define FAIL_RANK 2
+#define FAIL_K 0
+#define CHECKPOINT_FILENAME "checkpoint.bin"
 
 static double bench_t_start, bench_t_end;
 
@@ -38,7 +34,7 @@ static int spare_count = 2;
 static int desired_active;
 
 // Информация о текущем состоянии вычислений
-static int kk_current = 0;
+static int k_current = 0;
 static int checkpoint_interval = 1;
 
 // Матрицы
@@ -50,32 +46,31 @@ static float *C = NULL;
 static BlockInfo *blocks = NULL;
 static int num_blocks = 0;
 
+// Для расчёта времени работы GEMM
 static double rtclock() {
     struct timeval Tp;
     gettimeofday(&Tp, NULL);
     return (Tp.tv_sec + Tp.tv_usec * 1.0e-6);
 }
-
 void bench_timer_start() { bench_t_start = rtclock(); }
 void bench_timer_stop() { bench_t_end = rtclock(); }
 void bench_timer_print() { printf("%0.6lf\n", bench_t_end - bench_t_start); }
 
 // Логирование
-#define ROOTLOG(fmt, ...) do { \
-    if (process_rank == 0) { \
-        printf("[root] " fmt "\n", ##__VA_ARGS__); \
-        fflush(stdout); \
-    } \
+#define ROOTLOG(fmt, ...) do {\
+    if (process_rank == 0) {\
+        printf("[root] " fmt "\n", ##__VA_ARGS__);\
+        fflush(stdout);\
+    }\
 } while (0)
 
-#define RANKLOG(fmt, ...) do { \
-    printf("[rank %d] " fmt "\n", process_rank, ##__VA_ARGS__); \
-    fflush(stdout); \
+#define RANKLOG(fmt, ...) do {\
+    printf("[rank %d] " fmt "\n", process_rank, ##__VA_ARGS__);\
+    fflush(stdout);\
 } while (0)
 
-// Функция для определения принадлежности блока процессу
-static int block_belongs_to_process(int block_i, int block_j,
-                                    int num_blocks_j, int rank, int size) {
+// Определение принадлежности блока процессу
+static int block_belongs_to_process(int block_i, int block_j, int num_blocks_j, int rank, int size) {
     int block_id = block_i * num_blocks_j + block_j;
     return (block_id % size == rank);
 }
@@ -166,31 +161,21 @@ static void init_matrices(float alpha, float beta) {
             }
         }
     }
-    
-    for (int b = 0; b < num_blocks; b++) {
-        for (int i = blocks[b].start_i; i < blocks[b].end_i; i++) {
-            for (int j = blocks[b].start_j; j < blocks[b].end_j; j++) {
-                C[i * NJ + j] *= beta;
-            }
-        }
-    }
 }
 
 // Запись контрольной точки
-static int checkpoint_write(int kk) {
+static int checkpoint_write(int k) {
     MPI_File fh;
     MPI_Status st;
     
-    int err = MPI_File_open(main_comm, "gemm_checkpoint.bin",
-                           MPI_MODE_WRONLY | MPI_MODE_CREATE,
-                           MPI_INFO_NULL, &fh);
+    int err = MPI_File_open(main_comm, CHECKPOINT_FILENAME, MPI_MODE_WRONLY | MPI_MODE_CREATE, MPI_INFO_NULL, &fh);
     if (err != MPI_SUCCESS) {
-        if (process_rank == 0) ROOTLOG("ERROR: MPI_File_open(write) err=%d", err);
+        ROOTLOG("ERROR: MPI_File_open(write) err=%d", err);
         return err;
     }
     
     if (process_rank == 0) {
-        err = MPI_File_write_at(fh, 0, &kk, 1, MPI_INT, &st);
+        err = MPI_File_write_at(fh, 0, &k, 1, MPI_INT, &st);
         if (err != MPI_SUCCESS) {
             MPI_File_close(&fh);
             return err;
@@ -205,12 +190,9 @@ static int checkpoint_write(int kk) {
             int end_j = blocks[b].end_j;
             int count = end_j - start_j;
             
-            MPI_Offset offset = sizeof(int) + 
-                              ((size_t)i * NJ + start_j) * sizeof(float);
+            MPI_Offset offset = sizeof(int) + ((size_t)i * NJ + start_j) * sizeof(float);
             
-            err = MPI_File_write_at(fh, offset, 
-                                   &C[i * NJ + start_j], 
-                                   count, MPI_FLOAT, &st);
+            err = MPI_File_write_at(fh, offset, &C[i * NJ + start_j], count, MPI_FLOAT, &st);
             if (err != MPI_SUCCESS) {
                 MPI_File_close(&fh);
                 return err;
@@ -219,37 +201,33 @@ static int checkpoint_write(int kk) {
     }
     
     MPI_File_close(&fh);
-    
-    if (process_rank == 0 && (kk % (BLOCK_SIZE * 10) == 0 || kk == NK)) {
-        ROOTLOG("Checkpoint written at kk=%d", kk);
-    }
+    //RANKLOG("Checkpoint written at k=%d", k);
     
     return MPI_SUCCESS;
 }
 
 // Чтение контрольной точки
-static int checkpoint_read(int *kk) {
+static int checkpoint_read(int *k) {
     MPI_File fh;
     
-    int err = MPI_File_open(main_comm, "gemm_checkpoint.bin",
-                           MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
+    int err = MPI_File_open(main_comm, CHECKPOINT_FILENAME, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
     if (err != MPI_SUCCESS) {
-        if (process_rank == 0) ROOTLOG("No checkpoint found");
+        ROOTLOG("No checkpoint found");
         return 0;
     }
     
     if (process_rank == 0) {
-        err = MPI_File_read_at(fh, 0, kk, 1, MPI_INT, MPI_STATUS_IGNORE);
+        err = MPI_File_read_at(fh, 0, k, 1, MPI_INT, MPI_STATUS_IGNORE);
         if (err != MPI_SUCCESS) {
             MPI_File_close(&fh);
             return -1;
         }
     }
     
-    MPI_Bcast(kk, 1, MPI_INT, 0, main_comm);
+    MPI_Bcast(k, 1, MPI_INT, 0, main_comm);
     
-    if (*kk < 0 || *kk > NK) {
-        if (process_rank == 0) ROOTLOG("Invalid checkpoint kk=%d", *kk);
+    if (*k < 0 || *k > NK) {
+        ROOTLOG("Invalid checkpoint k=%d", *k);
         MPI_File_close(&fh);
         return 0;
     }
@@ -260,12 +238,9 @@ static int checkpoint_read(int *kk) {
             int end_j = blocks[b].end_j;
             int count = end_j - start_j;
             
-            MPI_Offset offset = sizeof(int) + 
-                              ((size_t)i * NJ + start_j) * sizeof(float);
+            MPI_Offset offset = sizeof(int) + ((size_t)i * NJ + start_j) * sizeof(float);
             
-            err = MPI_File_read_at(fh, offset, 
-                                  &C[i * NJ + start_j], 
-                                  count, MPI_FLOAT, MPI_STATUS_IGNORE);
+            err = MPI_File_read_at(fh, offset, &C[i * NJ + start_j], count, MPI_FLOAT, MPI_STATUS_IGNORE);
             if (err != MPI_SUCCESS) {
                 MPI_File_close(&fh);
                 return -1;
@@ -275,22 +250,23 @@ static int checkpoint_read(int *kk) {
     
     MPI_File_close(&fh);
     
-    if (process_rank == 0) {
-        ROOTLOG("Checkpoint loaded, kk=%d", *kk);
-    }
+    RANKLOG("Checkpoint loaded, k=%d", *k);
     
     return 1;
 }
 
 // Вычисление одного блока по k
-static int compute_k_block(int kk_start, float alpha) {
-    int kk_end = kk_start + BLOCK_SIZE;
-    if (kk_end > NK) kk_end = NK;
+static int compute_k_block(int k_start, float alpha, float beta) {
+    int k_end = k_start + BLOCK_SIZE;
+    if (k_end > NK) k_end = NK;
     
     for (int b = 0; b < num_blocks; b++) {
         for (int i = blocks[b].start_i; i < blocks[b].end_i; i++) {
             for (int j = blocks[b].start_j; j < blocks[b].end_j; j++) {
-                for (int k = kk_start; k < kk_end; k++) {
+                if (k_start == 0) {
+                    C[i * NJ + j] *= beta;
+                }
+                for (int k = k_start; k < k_end; k++) {
                     C[i * NJ + j] += alpha * A[i * NK + k] * B[k * NJ + j];
                 }
             }
@@ -311,19 +287,19 @@ static int run_gemm(float alpha, float beta) {
     err = MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
     if (err != MPI_SUCCESS) return err;
     
-    for (int kk = kk_current; kk < NK; kk += BLOCK_SIZE) {
+    for (int k = k_current; k < NK; k += BLOCK_SIZE) {
         // Симуляция сбоя
-        if (!failure_simulated && world_rank0 == 2 && kk == FAIL_KK * BLOCK_SIZE) {
-            RANKLOG("Simulating failure at kk=%d (world_rank0=%d)", kk, world_rank0);
+        if (!failure_simulated && world_rank0 == FAIL_RANK && k == FAIL_K) {
+            RANKLOG("Simulating failure at k=%d (world_rank0=%d)", k, world_rank0);
             failure_simulated = 1;
             raise(SIGKILL);
         }
         
-        err = compute_k_block(kk, alpha);
+        err = compute_k_block(k, alpha, beta);
         if (err != MPI_SUCCESS) return err;
         
-        if ((kk / BLOCK_SIZE) % checkpoint_interval == 0 || kk + BLOCK_SIZE >= NK) {
-            err = checkpoint_write(kk + BLOCK_SIZE);
+        if ((k / BLOCK_SIZE) % checkpoint_interval == 0 || k + BLOCK_SIZE >= NK) {
+            err = checkpoint_write(k + BLOCK_SIZE);
             if (err != MPI_SUCCESS) return err;
         }
     }
@@ -331,7 +307,6 @@ static int run_gemm(float alpha, float beta) {
     return MPI_SUCCESS;
 }
 
-// Восстановление после сбоя
 // Восстановление после сбоя
 static int recovery_procedure(float alpha, float beta) {
     ROOTLOG("Failure detected, revoke+shrink communicator");
@@ -347,76 +322,52 @@ static int recovery_procedure(float alpha, float beta) {
     MPI_Comm_size(main_comm, &process_count);
     MPI_Comm_rank(main_comm, &process_rank);
 
-    ROOTLOG("New communicator: size=%d", process_count);
-
-    // Уменьшаем количество spare процессов на 1
+    // Рассчитываем новое кол-во резервных и активных процессов
     if (spare_count > 0) {
         spare_count--;
-        ROOTLOG("Spare count decreased to %d", spare_count);
     }
-
-    // Рассчитываем новое количество активных процессов
     // Активных должно остаться столько же, сколько было до сбоя
     int new_active = process_count - spare_count;
-    if (new_active < 1) new_active = process_count; // Все процессы активные, если spare_count >= process_count
 
-    // Перераспределяем блоки ТОЛЬКО для активных процессов
+    ROOTLOG("New communicator: size=%d: %d active, %d spare", process_count, new_active, spare_count);
+    if (new_active < 1) {
+        ROOTLOG("ERROR: Not enough processes left");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Перераспределяем блоки на активные процессы
     free_resources();
     if (allocate_matrices() != 0) {
         ROOTLOG("ERROR: Allocation failed after shrink");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-
-    // ВАЖНО: блоки получают только активные процессы (ранг < new_active)
     if (process_rank < new_active) {
         blocks = get_process_blocks(NI, NJ, process_rank, new_active, &num_blocks);
-        ROOTLOG("Active process with %d blocks", num_blocks);
+        RANKLOG("Active process with %d blocks", num_blocks);
     } else {
         // Spare процессы остаются без блоков
         blocks = NULL;
         num_blocks = 0;
-        ROOTLOG("Spare process - no blocks assigned");
+        RANKLOG("Spare process - no blocks assigned");
     }
 
     // Восстановление из контрольной точки
-    int kk_from_cp = 0;
-    int cp_res = checkpoint_read(&kk_from_cp);
+    int k_from_cp = 0;
+    int cp_res = checkpoint_read(&k_from_cp);
 
     if (cp_res <= 0) {
-        kk_current = 0;
+        k_current = 0;
         // Инициализируем матрицы (только активные процессы инициализируют свои блоки C)
         init_matrices(alpha, beta);
         ROOTLOG("No checkpoint found, starting from scratch");
     } else {
-        kk_current = kk_from_cp;
+        k_current = k_from_cp;
         // Рассылаем A и B всем процессам (и активным, и spare)
         MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
         MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
-        ROOTLOG("Restarting from checkpoint kk=%d", kk_current);
+        ROOTLOG("Restarting from checkpoint kk=%d", k_current);
     }
 
-    return MPI_SUCCESS;
-}
-
-// Проверка результата
-static int verify_result(void) {
-    double sum_local = 0.0, sum_global;
-    
-    for (int b = 0; b < num_blocks; b++) {
-        for (int i = blocks[b].start_i; i < blocks[b].end_i; i++) {
-            for (int j = blocks[b].start_j; j < blocks[b].end_j; j++) {
-                sum_local += C[i * NJ + j];
-            }
-        }
-    }
-    
-    int err = MPI_Reduce(&sum_local, &sum_global, 1, MPI_DOUBLE, MPI_SUM, 0, main_comm);
-    if (err != MPI_SUCCESS) return err;
-    
-    if (process_rank == 0) {
-        ROOTLOG("Verification sum = %f", sum_global);
-    }
-    
     return MPI_SUCCESS;
 }
 
@@ -439,11 +390,8 @@ int main(int argc, char **argv) {
     desired_active = world_size0 - spare_count;
     if (desired_active < 1) desired_active = world_size0;
 
-    if (process_rank == 0) {
-        ROOTLOG("GEMM start: NI=%d, NJ=%d, NK=%d", NI, NJ, NK);
-        ROOTLOG("Total ranks=%d, active=%d, spare=%d",
-                world_size0, desired_active, spare_count);
-    }
+    ROOTLOG("GEMM start: NI=%d, NJ=%d, NK=%d", NI, NJ, NK);
+    ROOTLOG("Total ranks=%d, active=%d, spare=%d", world_size0, desired_active, spare_count);
 
     // Инициализация блоков для активных процессов
     if (process_rank < desired_active) {
@@ -455,15 +403,15 @@ int main(int argc, char **argv) {
     }
 
     if (allocate_matrices() != 0) {
-        if (process_rank == 0) ROOTLOG("ERROR: Allocation failed");
+        ROOTLOG("ERROR: Allocation failed");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     float alpha = 1.5, beta = 1.2;
 
-    int cp_res = checkpoint_read(&kk_current);
+    int cp_res = checkpoint_read(&k_current);
     if (cp_res <= 0) {
-        kk_current = 0;
+        k_current = 0;
         init_matrices(alpha, beta);
     }
 
@@ -489,24 +437,24 @@ int main(int argc, char **argv) {
         MPI_Reduce(C, NULL, NI * NJ, MPI_FLOAT, MPI_SUM, 0, main_comm);
     }
 
-    verify_result();
-
     if (process_rank == 0) {
         printf("\nTime: ");
         bench_timer_print();
 
-        printf("\nFirst 4x4 of matrix C:\n");
-        for (int i = 0; i < 4 && i < NI; i++) {
-            for (int j = 0; j < 4 && j < NJ; j++) {
+        printf("\nResult on matrix C:\n");
+        for (int i = 0; i < NI; i++) {
+            for (int j = 0; j < NJ; j++) {
                 printf("%8.4f ", C[i * NJ + j]);
             }
             printf("\n");
         }
+
+        //print_array(NI, NJ, C);
     }
 
     free_resources();
 
-    if (process_rank == 0) ROOTLOG("Finalizing MPI");
+    ROOTLOG("Finalizing MPI");
     MPI_Finalize();
     return 0;
 }
