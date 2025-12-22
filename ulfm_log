@@ -1,17 +1,18 @@
 [root] Total ranks=6, active=4, spare=2
+[rank 2] Simulating failure (world_rank0=0)
 [root] No checkpoint found
-[rank 2] Simulating failure (world_rank0=2)
+[root] ERROR: MPI_File_open(write) err=77
 [root] Failure detected, revoke+shrink communicator
 [root] New communicator: size=5: 4 active, 1 spare
 [rank 0] Active process with 1 blocks
-[rank 3] Active process with 1 blocks
-[rank 2] Active process with 1 blocks
 [rank 4] Spare process - no blocks assigned
+[rank 3] Active process with 1 blocks
 [rank 1] Active process with 1 blocks
+[rank 2] Active process with 1 blocks
 [root] No checkpoint found
 [root] No checkpoint found, starting from scratch
 
-Time: 0.051218
+Time: 0.068328
 
 Result on matrix C:
 0.30 0.30 0.30 0.30 
