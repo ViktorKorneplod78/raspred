@@ -145,21 +145,22 @@ static int allocate_matrices(void) {
     return 0;
 }
 
-// Инициализация матриц
-static void init_matrices(float alpha, float beta) {
-    if (process_rank == 0) {
-        for (int i = 0; i < NI; i++) {
-            for (int j = 0; j < NK; j++) {
-                A[i * NK + j] = (float)(i * (j + 1) % NK) / NK;
-            }
-        }
-        for (int i = 0; i < NK; i++) {
-            for (int j = 0; j < NJ; j++) {
-                B[i * NJ + j] = (float)(i * (j + 2) % NJ) / NJ;
-            }
+// Инициализация матриц A и B
+static void init_AB(float alpha, float beta) {
+    for (int i = 0; i < NI; i++) {
+        for (int j = 0; j < NK; j++) {
+            A[i * NK + j] = (float)(i * (j + 1) % NK) / NK;
         }
     }
+    for (int i = 0; i < NK; i++) {
+        for (int j = 0; j < NJ; j++) {
+            B[i * NJ + j] = (float)(i * (j + 2) % NJ) / NJ;
+        }
+    }
+}
 
+// Инициализация только своих блоков C, остальные нули
+static void init_C(float alpha, float beta) {
     memset(C, 0, NI * NJ * sizeof(float));
     for (int b = 0; b < num_blocks; b++) {
         for (int i = blocks[b].start_i; i < blocks[b].end_i; i++) {
@@ -188,7 +189,6 @@ static int checkpoint_write(int k) {
             return err;
         }
     }
-
     MPI_Barrier(main_comm);
 
     for (int b = 0; b < num_blocks; b++) {
@@ -209,7 +209,6 @@ static int checkpoint_write(int k) {
 
     MPI_File_close(&fh);
     //RANKLOG("Checkpoint written at k=%d", k);
-
     return MPI_SUCCESS;
 }
 
@@ -223,15 +222,11 @@ static int checkpoint_read(int *k) {
         return 0;
     }
 
-    if (process_rank == 0) {
-        err = MPI_File_read_at(fh, 0, k, 1, MPI_INT, MPI_STATUS_IGNORE);
-        if (err != MPI_SUCCESS) {
-            MPI_File_close(&fh);
-            return -1;
-        }
+    err = MPI_File_read_at(fh, 0, k, 1, MPI_INT, MPI_STATUS_IGNORE);
+    if (err != MPI_SUCCESS) {
+        MPI_File_close(&fh);
+        return -1;
     }
-
-    MPI_Bcast(k, 1, MPI_INT, 0, main_comm);
 
     if (*k < 0 || *k > NK) {
         ROOTLOG("Invalid checkpoint k=%d", *k);
@@ -256,9 +251,7 @@ static int checkpoint_read(int *k) {
     }
 
     MPI_File_close(&fh);
-
     RANKLOG("Checkpoint loaded, k=%d", *k);
-
     return 1;
 }
 
@@ -356,16 +349,25 @@ static int recovery_procedure(float alpha, float beta) {
     int cp_res = checkpoint_read(&k_from_cp);
 
     if (cp_res <= 0) {
+        for (int i = 0; i < NI; i++) {
+            for (int j = 0; j < NK; j++) {
+                A[i * NK + j] = (float)(i * (j + 1) % NK) / NK;
+            }
+        }
+        for (int i = 0; i < NK; i++) {
+            for (int j = 0; j < NJ; j++) {
+                B[i * NJ + j] = (float)(i * (j + 2) % NJ) / NJ;
+            }
+        }
         k_current = 0;
         // Инициализируем матрицы (только активные процессы инициализируют свои блоки C)
-        init_matrices(alpha, beta);
+        init_C(alpha, beta);
         ROOTLOG("No checkpoint found, starting from scratch");
     } else {
         k_current = k_from_cp;
+        // Чтобы новый процесс получил матрицы A и B
         ROOTLOG("Restarting from checkpoint kk=%d", k_current);
     }
-    MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
-    MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
 
     return MPI_SUCCESS;
 }
@@ -389,7 +391,7 @@ int main(int argc, char **argv) {
     if (active_count < 1) active_count = world_size0;
     ROOTLOG("Total ranks=%d, active=%d, spare=%d", world_size0, active_count, spare_count);
 
-    // Инициализация блоков для активных процессов
+    // Назначение блоков только активным процессам
     if (process_rank < active_count) {
         blocks = get_process_blocks(NI, NJ, process_rank, active_count, &num_blocks);
     } else {
@@ -407,11 +409,10 @@ int main(int argc, char **argv) {
 
     int cp_res = checkpoint_read(&k_current);
     if (cp_res <= 0) {
+        init_AB(alpha, beta);
+        init_C(alpha, beta);
         k_current = 0;
-        init_matrices(alpha, beta);
     }
-    MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
-    MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
 
     bench_timer_start();
 
