@@ -286,6 +286,8 @@ static int run_gemm(float alpha, float beta) {
     static int failure_simulated = 0;
 
     for (int k = k_current; k < NK; k += BLOCK_SIZE) {
+        compute_k_block(k, alpha, beta);
+
         // Симуляция сбоя
         if (!failure_simulated && world_rank0 == FAIL_RANK && k == FAIL_K) {
             RANKLOG("Simulating failure (world_rank0=%d)", k, world_rank0);
@@ -293,8 +295,7 @@ static int run_gemm(float alpha, float beta) {
             raise(SIGKILL);
         }
 
-        compute_k_block(k, alpha, beta);
-
+        // Сбой будет обнаружен тут
         int err = MPI_Barrier(main_comm);
         if (err != MPI_SUCCESS) return err;
 
