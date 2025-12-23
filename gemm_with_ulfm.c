@@ -263,7 +263,7 @@ static int checkpoint_read(int *k) {
 }
 
 // Вычисление одного блока по k
-static int compute_k_block(int k_start, float alpha, float beta) {
+static void compute_k_block(int k_start, float alpha, float beta) {
     int k_end = k_start + BLOCK_SIZE;
     if (k_end > NK) k_end = NK;
 
@@ -279,8 +279,6 @@ static int compute_k_block(int k_start, float alpha, float beta) {
             }
         }
     }
-
-    return MPI_SUCCESS;
 }
 
 // Основная функция вычислений
@@ -296,13 +294,15 @@ static int run_gemm(float alpha, float beta) {
 
     for (int k = k_current; k < NK; k += BLOCK_SIZE) {
         // Симуляция сбоя
-        if (!failure_simulated && world_rank0 == FAIL_RANK) {
+        if (!failure_simulated && world_rank0 == FAIL_RANK && k == FAIL_K) {
             RANKLOG("Simulating failure (world_rank0=%d)", k, world_rank0);
             failure_simulated = 1;
             raise(SIGKILL);
         }
 
-        err = compute_k_block(k, alpha, beta);
+        compute_k_block(k, alpha, beta);
+        err = MPI_Barrier(main_comm);
+
         if (err != MPI_SUCCESS) return err;
 
         if ((k / BLOCK_SIZE) % checkpoint_interval == 0 || k + BLOCK_SIZE >= NK) {
