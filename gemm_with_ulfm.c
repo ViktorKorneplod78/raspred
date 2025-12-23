@@ -12,13 +12,14 @@
 #include <mpi.h>
 #include <mpi-ext.h>
 
-#define NI 4
-#define NJ 4
-#define NK 4
+#define NI 8
+#define NJ 8
+#define NK 8
 #define BLOCK_SIZE 2
 
 #define FAIL_RANK 2
-#define FAIL_K 0
+#define FAIL_K_ITER 2
+#define CHECKPOINT_INTERVAL 1
 #define SPARE_COUNT 2
 #define CHECKPOINT_FILENAME "checkpoint.bin"
 
@@ -42,7 +43,6 @@ static int active_count;
 
 // Информация о текущем состоянии вычислений
 static int k_current = 0;
-static int checkpoint_interval = 1;
 
 // Матрицы
 static float *A = NULL;
@@ -72,8 +72,8 @@ if (process_rank == 0) {\
 } while (0)
 
 #define RANKLOG(fmt, ...) do {\
-printf("[rank %d] " fmt "\n", process_rank, ##__VA_ARGS__);\
-fflush(stdout);\
+    printf("[rank %d] " fmt "\n", process_rank, ##__VA_ARGS__);\
+    fflush(stdout);\
 } while (0)
 
 // Определение принадлежности блока процессу
@@ -120,31 +120,6 @@ static BlockInfo* get_process_blocks(int ni, int nj, int rank, int size, int *nu
     return blocks;
 }
 
-// Освобождение ресурсов
-static void free_resources(void) {
-    free(blocks);
-    blocks = NULL;
-    num_blocks = 0;
-
-    free(A); A = NULL;
-    free(B); B = NULL;
-    free(C); C = NULL;
-}
-
-// Выделение памяти для матриц
-static int allocate_matrices(void) {
-    A = (float*)malloc(NI * NK * sizeof(float));
-    B = (float*)malloc(NK * NJ * sizeof(float));
-    C = (float*)malloc(NI * NJ * sizeof(float));
-
-    if (!A || !B || !C) {
-        free_resources();
-        return -1;
-    }
-
-    return 0;
-}
-
 // Инициализация матриц A и B
 static void init_AB(float alpha, float beta) {
     for (int i = 0; i < NI; i++) {
@@ -159,9 +134,8 @@ static void init_AB(float alpha, float beta) {
     }
 }
 
-// Инициализация только своих блоков C, остальные нули
+// Инициализация только своих блоков C
 static void init_C(float alpha, float beta) {
-    memset(C, 0, NI * NJ * sizeof(float));
     for (int b = 0; b < num_blocks; b++) {
         for (int i = blocks[b].start_i; i < blocks[b].end_i; i++) {
             for (int j = blocks[b].start_j; j < blocks[b].end_j; j++) {
@@ -282,7 +256,8 @@ static int run_gemm(float alpha, float beta) {
         compute_k_block(k, alpha, beta);
 
         // Симуляция сбоя
-        if (!failure_simulated && world_rank0 == FAIL_RANK && k == FAIL_K) {
+        if (!failure_simulated && world_rank0 == FAIL_RANK &&
+            (k / BLOCK_SIZE) == FAIL_K_ITER) {
             RANKLOG("Simulating failure (world_rank0=%d)", k, world_rank0);
             failure_simulated = 1;
             raise(SIGKILL);
@@ -292,9 +267,10 @@ static int run_gemm(float alpha, float beta) {
         int err = MPI_Barrier(main_comm);
         if (err != MPI_SUCCESS) return err;
 
-        if ((k / BLOCK_SIZE) % checkpoint_interval == 0 || k + BLOCK_SIZE >= NK) {
+        if ((k / BLOCK_SIZE) % CHECKPOINT_INTERVAL == 0) {
             err = checkpoint_write(k + BLOCK_SIZE);
-            if (err != MPI_SUCCESS) return err;
+            if (err != MPI_SUCCESS)
+                return err;
         }
     }
     return MPI_SUCCESS;
@@ -329,11 +305,10 @@ static int recovery_procedure(float alpha, float beta) {
     }
 
     // Перераспределяем блоки на активные процессы
-    free_resources();
-    if (allocate_matrices() != 0) {
-        ROOTLOG("ERROR: Allocation failed after shrink");
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
+    free(blocks);
+    blocks = NULL;
+    num_blocks = 0;
+    memset(C, 0, NI * NJ * sizeof(float));
     if (process_rank < new_active) {
         blocks = get_process_blocks(NI, NJ, process_rank, new_active, &num_blocks);
         RANKLOG("Active process with %d blocks", num_blocks);
@@ -349,24 +324,13 @@ static int recovery_procedure(float alpha, float beta) {
     int cp_res = checkpoint_read(&k_from_cp);
 
     if (cp_res <= 0) {
-        for (int i = 0; i < NI; i++) {
-            for (int j = 0; j < NK; j++) {
-                A[i * NK + j] = (float)(i * (j + 1) % NK) / NK;
-            }
-        }
-        for (int i = 0; i < NK; i++) {
-            for (int j = 0; j < NJ; j++) {
-                B[i * NJ + j] = (float)(i * (j + 2) % NJ) / NJ;
-            }
-        }
         k_current = 0;
-        // Инициализируем матрицы (только активные процессы инициализируют свои блоки C)
+        // Активные процессы инициализируют свои блоки C
         init_C(alpha, beta);
         ROOTLOG("No checkpoint found, starting from scratch");
     } else {
         k_current = k_from_cp;
-        // Чтобы новый процесс получил матрицы A и B
-        ROOTLOG("Restarting from checkpoint kk=%d", k_current);
+        ROOTLOG("Restarting from checkpoint k=%d", k_current);
     }
 
     return MPI_SUCCESS;
@@ -400,16 +364,21 @@ int main(int argc, char **argv) {
         num_blocks = 0;
     }
 
-    if (allocate_matrices() != 0) {
+    A = (float*)malloc(NI * NK * sizeof(float));
+    B = (float*)malloc(NK * NJ * sizeof(float));
+    C = (float*)malloc(NI * NJ * sizeof(float));
+
+    if (!A || !B || !C) {
         ROOTLOG("ERROR: Allocation failed");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     float alpha = 1.5, beta = 1.2;
+    init_AB(alpha, beta);
 
+    memset(C, 0, NI * NJ * sizeof(float));
     int cp_res = checkpoint_read(&k_current);
     if (cp_res <= 0) {
-        init_AB(alpha, beta);
         init_C(alpha, beta);
         k_current = 0;
     }
@@ -449,7 +418,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    free_resources();
+    free(blocks);
+    free(A);
+    free(B);
+    free(C);
     MPI_Finalize();
     return 0;
 }
