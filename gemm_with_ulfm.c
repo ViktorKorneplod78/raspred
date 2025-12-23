@@ -285,13 +285,6 @@ static void compute_k_block(int k_start, float alpha, float beta) {
 static int run_gemm(float alpha, float beta) {
     static int failure_simulated = 0;
 
-    // Рассылка A и B всем процессам
-    int err = MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
-    if (err != MPI_SUCCESS) return err;
-
-    err = MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
-    if (err != MPI_SUCCESS) return err;
-
     for (int k = k_current; k < NK; k += BLOCK_SIZE) {
         // Симуляция сбоя
         if (!failure_simulated && world_rank0 == FAIL_RANK && k == FAIL_K) {
@@ -301,8 +294,8 @@ static int run_gemm(float alpha, float beta) {
         }
 
         compute_k_block(k, alpha, beta);
-        err = MPI_Barrier(main_comm);
 
+        int err = MPI_Barrier(main_comm);
         if (err != MPI_SUCCESS) return err;
 
         if ((k / BLOCK_SIZE) % checkpoint_interval == 0 || k + BLOCK_SIZE >= NK) {
@@ -310,7 +303,6 @@ static int run_gemm(float alpha, float beta) {
             if (err != MPI_SUCCESS) return err;
         }
     }
-
     return MPI_SUCCESS;
 }
 
@@ -371,6 +363,8 @@ static int recovery_procedure(float alpha, float beta) {
         k_current = k_from_cp;
         ROOTLOG("Restarting from checkpoint kk=%d", k_current);
     }
+    MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
+    MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
 
     return MPI_SUCCESS;
 }
@@ -415,6 +409,8 @@ int main(int argc, char **argv) {
         k_current = 0;
         init_matrices(alpha, beta);
     }
+    MPI_Bcast(A, NI * NK, MPI_FLOAT, 0, main_comm);
+    MPI_Bcast(B, NK * NJ, MPI_FLOAT, 0, main_comm);
 
     bench_timer_start();
 
